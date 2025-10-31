@@ -1,0 +1,3 @@
+# Changelog: Keybind list redesign, explorer functional, darker overlay, global hide, cleanup, config menu
+
+local UILibrary = require(script:FindFirstAncestorWhichIsA("ModuleScript"))
