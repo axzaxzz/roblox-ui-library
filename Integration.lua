@@ -1,4 +1,4 @@
--- Integration v2: Uses the new modules and wires global toggle, config UI, and full cleanup
+-- Integration v3: enforce Insert as global toggle, never call overlay:Stop(), use Snow.stopAll
 local UILibrary = loadstring(game:HttpGet("https://raw.githubusercontent.com/axzaxzz/roblox-ui-library/main/UILibrary.lua"))()
 local Keybinds = loadstring(game:HttpGet("https://raw.githubusercontent.com/axzaxzz/roblox-ui-library/main/KeybindManager.lua"))()
 local Explorer = loadstring(game:HttpGet("https://raw.githubusercontent.com/axzaxzz/roblox-ui-library/main/Explorer.lua"))()
@@ -12,23 +12,24 @@ local Theme = {
 
 local Integration = {}
 Integration.theme = Theme
-Integration.overlay = nil
 
 function Integration.startOverlay()
-  if Integration.overlay and Integration.overlay.Parent then return end
-  Integration.overlay = Snow.start(game:GetService("CoreGui"), true)
+  Snow.stopAll()
+  Snow.start(game:GetService("CoreGui"), true)
 end
 
 function Integration.stopOverlay()
-  -- overlay is a Frame; Snow.start returns overlay with :Stop() in module but Roblox objects can't hold methods; fall back to Snow.stopAll()
   Snow.stopAll()
-  Integration.overlay = nil
+end
+
+local function getUILibGui()
+  local cg = game:GetService("CoreGui")
+  local pg = game.Players.LocalPlayer and game.Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
+  return (cg and cg:FindFirstChild("UILibraryGUI")) or (pg and pg:FindFirstChild("UILibraryGUI"))
 end
 
 function Integration.globalToggle()
-  local cg = game:GetService("CoreGui")
-  local pg = game.Players.LocalPlayer and game.Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-  local ui = (cg and cg:FindFirstChild("UILibraryGUI")) or (pg and pg:FindFirstChild("UILibraryGUI"))
+  local ui = getUILibGui()
   if ui and ui.Enabled ~= false then
     ui.Enabled = false
     Integration.stopOverlay()
@@ -41,29 +42,25 @@ function Integration.globalToggle()
 end
 
 function Integration.killAll()
-  local cg = game:GetService("CoreGui")
-  local pg = game.Players.LocalPlayer and game.Players.LocalPlayer:FindFirstChildOfClass("PlayerGui")
-  local ui = (cg and cg:FindFirstChild("UILibraryGUI")) or (pg and pg:FindFirstChild("UILibraryGUI"))
+  local ui = getUILibGui()
   if ui then ui:Destroy() end
   Integration.stopOverlay()
   Keybinds.closeAll()
   Explorer.closeAll()
 end
 
-function Integration.openExplorer()
-  Explorer.show(Theme)
+function Integration.bindInsert()
+  local UIS = game:GetService("UserInputService")
+  UIS.InputBegan:Connect(function(input, processed)
+    if not processed and input.KeyCode.Name == "Insert" then
+      Integration.globalToggle()
+    end
+  end)
 end
 
-function Integration.openKeybinds()
-  Keybinds.showList(Theme)
-end
-
-function Integration.saveConfig(name, data)
-  return Config.save(name, data)
-end
-
-function Integration.loadConfig(name)
-  return Config.load(name)
-end
+function Integration.openExplorer() Explorer.show(Theme) end
+function Integration.openKeybinds() Keybinds.showList(Theme) end
+function Integration.saveConfig(name, data) return Config.save(name, data) end
+function Integration.loadConfig(name) return Config.load(name) end
 
 return Integration
