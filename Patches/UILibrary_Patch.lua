@@ -1,5 +1,4 @@
 -- Patch UILibrary CreateGradient to use ColorUtil.toColorSequence; tighten radii, remove floating, set height
-local HttpService = game:GetService("HttpService")
 local function fetch(path)
     return loadstring(game:HttpGet("https://raw.githubusercontent.com/axzaxzz/roblox-ui-library/main/"..path))()
 end
@@ -31,4 +30,4 @@ src = src:gsub("%-%- Floating effect[\n\r]+spawn%(%(function%)%)[%s%S]-end%)", "
 src = src:gsub("Size = UDim2.new%(%s*0,%s*options.Size and options.Size.X or %d+,%s*0,%s*options.Size and options.Size.Y or %d+%s*%)",
                "Size = UDim2.new(0, options.Size and options.Size.X or "..Theme.Window.Width..", 0, options.Size and options.Size.Y or "..Theme.Window.Height..")")
 
-return src], 
+return src
