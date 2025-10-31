@@ -1,10 +1,11 @@
 -- Apply patch to live UILibrary
-local src = loadstring(game:HttpGet("https://raw.githubusercontent.com/axzaxzz/roblox-ui-library/main/Patches/UILibrary_Patch.lua"))()
+local patch = loadstring(game:HttpGet("https://raw.githubusercontent.com/axzaxzz/roblox-ui-library/main/Patches/UILibrary_Patch.lua"))()
 
--- Write back not possible at runtime; return a patched module loader instead
-local function requirePatched()
-    local f = loadstring(src)
-    return f()
+-- Compile the patched source into a module table
+local function loadPatched()
+    local libFactory = loadstring(patch)
+    return libFactory()
 end
 
-return requirePatched
+-- Return the patched library table directly (not a function)
+return loadPatched()
