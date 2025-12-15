@@ -1,0 +1,1107 @@
+#define NOMINMAX
+#include "GigaLearnBot.hpp"
+#include <iostream>
+#include <vector>
+#include <cmath>
+
+// Compile-time CUDA checks
+#ifdef USE_CUDA
+#pragma message("✓ Compiled with USE_CUDA")
+#else
+#pragma message("⚠ WARNING: USE_CUDA not defined - LibTorch will be CPU-only!")
+#endif
+
+#ifdef TORCH_CUDA_VERSION
+#pragma message("✓ TORCH_CUDA_VERSION defined")
+#else
+#pragma message("⚠ WARNING: TORCH_CUDA_VERSION not defined!")
+#endif
+
+#pragma message("LibTorch version: " TORCH_VERSION)
+
+#include <filesystem>
+#include <fstream>
+#include <sstream>
+// Include Nexto Helpers
+#include "NextoEARLHelpers.hpp"
+
+// ... (existing includes)
+
+// Static member initialization
+bool GigaLearnModule::IsInGame = false;
+bool GigaLearnModule::BotEnabled = false;
+AGameEvent_Soccar_TA* GigaLearnModule::CurrentGameEvent = nullptr;
+APlayerController_TA* GigaLearnModule::LocalPlayerController = nullptr;
+Action GigaLearnModule::prevAction = {0, 0, 0, 0, 0, 0, 0, 0};
+GigaLearnModule::BotConfig GigaLearnModule::CurrentBotConfig; // New config instance
+
+torch::jit::script::Module GigaLearnModule::sharedHeadModel;
+torch::jit::script::Module GigaLearnModule::policyModel;
+bool GigaLearnModule::modelsInitialized = false;
+torch::Device* GigaLearnModule::device = nullptr;
+bool GigaLearnModule::modelLoaded = false;
+int GigaLearnModule::frameCounter = 0;
+bool GigaLearnModule::bShowGUI = true;
+std::vector<Action> GigaLearnModule::actionLookupTable;
+bool GigaLearnModule::actionTableInitialized = false;
+torch::Tensor GigaLearnModule::recH;
+torch::Tensor GigaLearnModule::recC;
+
+// Boost Pad Timer System
+std::array<BoostPadState, 34> GigaLearnModule::boostPadCache;
+bool GigaLearnModule::boostCacheInitialized = false;
+
+// Config Parser Helper
+GigaLearnModule::BotConfig GigaLearnModule::ParseConfig(std::string folderPath) {
+    BotConfig config;
+    config.FolderPath = folderPath;
+    config.Name = "Unknown Bot";
+    config.Type = "GigaLearn"; // Default
+    config.ObsType = "AdvancedObs_1v1"; // Default
+    config.ActionType = "LookupTable"; // Default
+    config.ModelPath1 = "shared_head.pt";
+    config.ModelPath2 = "policy.pt";
+
+    std::string configPath = folderPath + "/bot.json";
+    std::ifstream file(configPath);
+    if (file.is_open()) {
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        std::string content = buffer.str();
+        
+        // Very basic JSON parsing (manual, to avoid adding a dependency)
+        auto getVal = [&](std::string key) -> std::string {
+            size_t keyPos = content.find("\"" + key + "\"");
+            if (keyPos == std::string::npos) return "";
+            size_t valStart = content.find(":", keyPos) + 1;
+            size_t quoteStart = content.find("\"", valStart);
+            size_t quoteEnd = content.find("\"", quoteStart + 1);
+            if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
+                return content.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
+            }
+            return "";
+        };
+
+        std::string name = getVal("name"); if (!name.empty()) config.Name = name;
+        std::string type = getVal("type"); if (!type.empty()) config.Type = type;
+        std::string obs = getVal("obs"); if (!obs.empty()) config.ObsType = obs;
+        std::string action = getVal("action"); if (!action.empty()) config.ActionType = action;
+        std::string m1 = getVal("model1"); if (!m1.empty()) config.ModelPath1 = m1;
+        std::string m2 = getVal("model2"); if (!m2.empty()) config.ModelPath2 = m2;
+        
+        // Recurrent Config (Robust Search)
+        // Check for "recurrent" key and see if "true" follows it closely
+        size_t recPos = content.find("\"recurrent\"");
+        if (recPos != std::string::npos) {
+            size_t colon = content.find(":", recPos);
+            if (colon != std::string::npos) {
+                // Check substring after colon for "true"
+                std::string val = content.substr(colon + 1, 20); // check next 20 chars
+                if (val.find("true") != std::string::npos) config.IsRecurrent = true;
+            }
+        }
+        
+        // Hidden Size
+        size_t hsPos = content.find("\"hidden_size\"");
+        if (hsPos != std::string::npos) {
+            size_t valStart = content.find(":", hsPos) + 1;
+            size_t valEnd = content.find_first_of(",}", valStart);
+            if (valEnd != std::string::npos) {
+                std::string numStr = content.substr(valStart, valEnd - valStart);
+                // Clean newlines/spaces
+                std::string cleanNum;
+                for(char c : numStr) if(isdigit(c)) cleanNum += c;
+                try { config.HiddenSize = std::stoi(cleanNum); } catch(...) {}
+            }
+        }
+
+        // Auto-configure defaults for known types
+        if (config.Type == "Nexto" || config.ObsType == "NextoObs") {
+            // Nexto V2 (EARL) uses specific ObsType, handled in PlayerTick
+            // It is NOT recurrent in the LSTM sense.
+        }
+        
+        Console.Write("GigaLearn: Loaded config for " + config.Name);
+    } else {
+        Console.Write("GigaLearn: No bot.json found in " + folderPath + ", using defaults.");
+    }
+    return config;
+}
+
+bool GigaLearnModule::LoadBot(std::string folderPath) {
+    try {
+        CurrentBotConfig = ParseConfig(folderPath);
+        
+        // Reset models
+        modelsInitialized = false;
+        modelLoaded = false;
+        
+        // Determine Device
+        // Determine Device Type
+        torch::DeviceType targetDeviceType = torch::kCPU;
+        if (CurrentBotConfig.ObsType != "NextoObs" && torch::cuda::is_available()) {
+            targetDeviceType = torch::kCUDA;
+        } else if (CurrentBotConfig.ObsType == "NextoObs") {
+             Console.Write("GigaLearn: Nexto detected. Forcing CPU to avoid model script device mismatch.");
+        }
+
+        // Re-allocate device if needed
+        if (device) {
+            if (device->type() != targetDeviceType) {
+                delete device;
+                device = new torch::Device(targetDeviceType);
+            }
+        } else {
+            device = new torch::Device(targetDeviceType);
+        }
+        
+        if (device->type() == torch::kCUDA) {
+            Console.Write("GigaLearn: Using CUDA GPU.");
+        } else {
+            Console.Write("GigaLearn: Using CPU.");
+        }
+        
+        // Load Model 1 (Shared or Main)
+        std::string path1 = folderPath + "/" + CurrentBotConfig.ModelPath1;
+        Console.Write("GigaLearn: Loading Model 1 from " + path1);
+        sharedHeadModel = torch::jit::load(path1, *device);
+        sharedHeadModel.eval();
+        
+        // Load Model 2 (Policy - Optional, for GigaLearn)
+        if (CurrentBotConfig.Type == "GigaLearn" && !CurrentBotConfig.ModelPath2.empty()) {
+            std::string path2 = folderPath + "/" + CurrentBotConfig.ModelPath2;
+            Console.Write("GigaLearn: Loading Model 2 from " + path2);
+            policyModel = torch::jit::load(path2, *device);
+            policyModel.eval();
+        }
+        
+        // Initialize Recurrent States
+        if (CurrentBotConfig.IsRecurrent) {
+            Console.Write("GigaLearn: Initializing Recurrent States (Hidden Size: " + std::to_string(CurrentBotConfig.HiddenSize) + ")");
+            // Shape: [1, 1, HiddenSize] or [1, HiddenSize]?
+            // Usually [Layers, Batch, Hidden] for Torch LSTM.
+            // Since it's jit::script::Module forward((obs, h, c)), usually H and C are [Batch, HiddenSize] or [1, Batch, HiddenSize].
+            // RLGym usually expects [1, 1, HiddenSize] for single agent?
+            // Let's assume [1, HiddenSize] first based on "Tensor" type output.
+            // Wait, error said "Expected Tuple[Tensor, Tensor, Tensor]".
+            // If the model expects (obs, h, c), let's init them as specific size.
+            // Trying [1, HiddenSize] to start.
+            
+            // NOTE: Nexto RLGym usually uses 512 hidden size.
+            recH = torch::zeros({1, CurrentBotConfig.HiddenSize}, *device);
+            recC = torch::zeros({1, CurrentBotConfig.HiddenSize}, *device);
+        }
+        
+        // Initialize Lookups if needed
+        BuildActionLookupTable();
+        
+        modelsInitialized = true;
+        modelLoaded = true;
+        Console.Write("GigaLearn: Bot " + CurrentBotConfig.Name + " Loaded Successfully!");
+        return true;
+    }
+    catch (const c10::Error& e) {
+        Console.Error("GigaLearn: Torch Error loading bot: " + std::string(e.what()));
+        return false;
+    }
+    catch (const std::exception& e) {
+        Console.Error("GigaLearn: Exception loading bot: " + std::string(e.what()));
+        return false;
+    }
+    catch (...) {
+        Console.Error("GigaLearn: Unknown error loading bot.");
+        return false;
+    }
+}
+
+
+GigaLearnModule::GigaLearnModule() : Module("GigaLearnBot", "AI Bot using LibTorch GigaLearn model", States::STATES_All) {
+    OnCreate();
+}
+
+GigaLearnModule::~GigaLearnModule() {
+    OnDestroy();
+}
+
+void GigaLearnModule::OnCreate() {
+    // Don't load models here - Console isn't initialized yet!
+    // Model loading moved to Initialize()
+}
+
+void GigaLearnModule::OnDestroy() {
+    if (device) {
+        delete device;
+        device = nullptr;
+    }
+    actionLookupTable.clear();
+    actionTableInitialized = false;
+    modelLoaded = false;
+}
+
+void GigaLearnModule::Hook() {
+    Events.HookEventPre("Function TAGame.GameEvent_Soccar_TA.PostBeginPlay", OnGameEventStart);
+    Events.HookEventPre("Function TAGame.GameEvent_Soccar_TA.Destroyed", OnGameEventDestroyed);
+    Events.HookEventPre("Function TAGame.GameEvent_Soccar_TA.Active.BeginState", OnGameEventStart);
+    Events.HookEventPost("Function TAGame.PlayerController_TA.PlayerTick", PlayerTickCalled);
+    
+    // Boost Pad Timer System hooks
+    Events.HookEventPre("Function TAGame.VehiclePickup_TA.OnPickUp", OnBoostPickedUp);
+    Events.HookEventPre("Function TAGame.VehiclePickup_TA.Respawn", OnBoostRespawn);
+}
+
+void GigaLearnModule::OnGameEventDestroyed(PreEvent& event) {
+    try {
+        CurrentGameEvent = nullptr;
+        IsInGame = false;
+        LocalPlayerController = nullptr;
+        
+        // Reset boost pad cache on game end
+        ResetBoostPadCache();
+    } catch (...) {
+        Console.Error("GigaLearn: Exception in OnGameEventDestroyed");
+    }
+}
+
+void GigaLearnModule::OnGameEventStart(PreEvent& event) {
+    try {
+        if (event.Caller() && event.Caller()->IsA(AGameEvent_Soccar_TA::StaticClass())) {
+            CurrentGameEvent = static_cast<AGameEvent_Soccar_TA*>(event.Caller());
+            IsInGame = true;
+            Console.Write("GigaLearn: Game event started");
+            
+            // Initialize boost pad cache at game start
+            InitializeBoostPadCache();
+        }
+    } catch (...) {
+        Console.Error("GigaLearn: Exception in OnGameEventStart");
+    }
+}
+
+// --- Boost Pad Timer System Implementation ---
+
+void GigaLearnModule::InitializeBoostPadCache() {
+    for (int i = 0; i < 34; i++) {
+        boostPadCache[i].location = NEXTO_BOOST_LOCATIONS[i];
+        boostPadCache[i].isActive = true;
+        boostPadCache[i].pickedUpTime = 0.0f;
+        
+        // Big pads have Z > 72 (73.0 in the list)
+        boostPadCache[i].isBig = (boostPadCache[i].location.z > 72.0f);
+        boostPadCache[i].respawnDelay = boostPadCache[i].isBig ? BIG_BOOST_RESPAWN : SMALL_BOOST_RESPAWN;
+    }
+    boostCacheInitialized = true;
+    Console.Write("GigaLearn: Boost pad cache initialized (34 pads)");
+}
+
+void GigaLearnModule::ResetBoostPadCache() {
+    for (int i = 0; i < 34; i++) {
+        boostPadCache[i].isActive = true;
+        boostPadCache[i].pickedUpTime = 0.0f;
+    }
+    boostCacheInitialized = false;
+    Console.Write("GigaLearn: Boost pad cache reset");
+}
+
+// Helper: Find nearest boost pad index by location
+static int FindNearestBoostPad(const FVector& location) {
+    float minDistSq = FLT_MAX;
+    int nearestIdx = -1;
+    
+    for (int i = 0; i < 34; i++) {
+        Vec3 padLoc = GigaLearnModule::boostPadCache[i].location;
+        float dx = location.X - padLoc.x;
+        float dy = location.Y - padLoc.y;
+        float dz = location.Z - padLoc.z;
+        float distSq = dx*dx + dy*dy + dz*dz;
+        
+        if (distSq < minDistSq) {
+            minDistSq = distSq;
+            nearestIdx = i;
+        }
+    }
+    
+    // Only match if within 200 units (reasonable tolerance)
+    if (minDistSq < 200.0f * 200.0f) {
+        return nearestIdx;
+    }
+    return -1;
+}
+
+void GigaLearnModule::OnBoostPickedUp(PreEvent& event) {
+    if (!boostCacheInitialized || !event.Caller()) return;
+    
+    try {
+        // Caller is AVehiclePickup_TA or derived class
+        AActor* pickup = static_cast<AActor*>(event.Caller());
+        FVector location = pickup->Location;
+        
+        int padIdx = FindNearestBoostPad(location);
+        if (padIdx >= 0) {
+            // Use system time for timer tracking
+            auto now = std::chrono::steady_clock::now();
+            double currentTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+            
+            boostPadCache[padIdx].isActive = false;
+            boostPadCache[padIdx].pickedUpTime = currentTime;
+        }
+    } catch (...) {
+        Console.Error("GigaLearn: Exception in OnBoostPickedUp");
+    }
+}
+
+void GigaLearnModule::OnBoostRespawn(PreEvent& event) {
+    if (!boostCacheInitialized || !event.Caller()) return;
+    
+    try {
+        AActor* pickup = static_cast<AActor*>(event.Caller());
+        FVector location = pickup->Location;
+        
+        int padIdx = FindNearestBoostPad(location);
+        if (padIdx >= 0) {
+            boostPadCache[padIdx].isActive = true;
+            boostPadCache[padIdx].pickedUpTime = 0.0f;
+        }
+    } catch (...) {
+        Console.Error("GigaLearn: Exception in OnBoostRespawn");
+    }
+}
+
+void GigaLearnModule::PlayerTickCalled(const PostEvent& event) {
+    // Only run bot if enabled, model loaded, in game, and caller is valid
+    if (!BotEnabled || !modelLoaded || !IsInGame || !CurrentGameEvent || 
+        !event.Caller() || !event.Caller()->IsA(APlayerController_TA::StaticClass())) {
+        return;
+    }
+
+    // Safety check: Model only supports 1v1 (2 cars max)
+    if (CurrentGameEvent->Cars.size() > 2) {
+        // Log warning once every 5 seconds (assuming 60 tick rate -> 300 frames)
+        static int warnCounter = 0;
+        if (warnCounter++ % 300 == 0) {
+            Console.Error("GigaLearn: Warning - More than 2 cars detected! Bot only supports 1v1.");
+        }
+        return;
+    }
+
+// ... Inside PlayerTickCalled ...
+
+    try {
+        APlayerController_TA* pc = static_cast<APlayerController_TA*>(event.Caller());
+        LocalPlayerController = pc;
+        frameCounter++;
+
+        torch::NoGradGuard no_grad; 
+        
+        // 1. Build Observation
+        torch::Tensor obs = GameStateToTensor(pc, CurrentGameEvent);
+        
+        if (obs.defined() && modelsInitialized) { // Removed actionTableInitialized check because Nexto doesn't use it
+             obs = obs.to(*device);
+             
+             Action action = {0}; // Default neutral
+             
+             // --- INFERENCE LOGIC SWITCH ---
+             
+             if (CurrentBotConfig.ObsType == "NextoObs") {
+                 // NEXTO V2 (EARL) CASE
+                 // Input: Tuple(q, kv, m)
+                 NextoEARLInput nextoIn = BuildNextoEARLObs(pc, CurrentGameEvent);
+                 
+                 if (nextoIn.valid) {
+                     std::vector<torch::jit::IValue> inputs;
+                     
+                     // Pack (q, kv, m) into a Tuple
+                     std::vector<torch::jit::IValue> tupleElements;
+                     tupleElements.push_back(nextoIn.q.to(*device));
+                     tupleElements.push_back(nextoIn.kv.to(*device));
+                     tupleElements.push_back(nextoIn.m.to(*device));
+                     
+                     inputs.push_back(c10::ivalue::Tuple::create(tupleElements));
+
+                     auto outputTuple = sharedHeadModel.forward(inputs).toTuple();
+                     
+                     // Output is (ActionDist Logits, (State...))
+                     // Element 0: Logits [1, 90]
+                     
+                     torch::Tensor logits = outputTuple->elements()[0].toTensor(); 
+                     
+                     logits = logits.to(torch::kCPU);
+                     
+                     // Helper to build table if not ready (though it should be)
+                     if (!actionTableInitialized) BuildActionLookupTable();
+
+                     // Argmax to get index
+                     torch::Tensor actionIndexTensor = logits.argmax(1);
+                     int actionIndex = actionIndexTensor.item<int>();
+                     
+                     action = GetActionFromIndex(actionIndex);
+                 }
+             }
+             else if (CurrentBotConfig.IsRecurrent) {
+                 // GIGALEARN Recurrent (Legacy/Future support if needed)
+                 // This is for models that take (obs, h, c) and return (action, (new_h, new_c))
+                 std::vector<torch::jit::IValue> inputs;
+                 std::vector<torch::jit::IValue> tupleElements;
+                 tupleElements.push_back(obs);
+                 tupleElements.push_back(recH);
+                 tupleElements.push_back(recC);
+                 inputs.push_back(c10::ivalue::Tuple::create(tupleElements));
+                 
+                 auto outputTuple = sharedHeadModel.forward(inputs).toTuple();
+                 // ... (Keep existing parsing) ...
+                 torch::Tensor actionTensor = outputTuple->elements()[0].toTensor();
+                 auto stateTuple = outputTuple->elements()[1].toTuple();
+                 recH = stateTuple->elements()[0].toTensor();
+                 recC = stateTuple->elements()[1].toTensor();
+                 
+                  actionTensor = actionTensor.to(torch::kCPU);
+                 auto accessor = actionTensor.accessor<float, 2>();
+                 if (actionTensor.size(1) >= 8) {
+                     action.throttle = accessor[0][0];
+                     action.steer = accessor[0][1];
+                     action.pitch = accessor[0][2];
+                     action.yaw = accessor[0][3];
+                     action.roll = accessor[0][4];
+                     action.jump = accessor[0][5];
+                     action.boost = accessor[0][6];
+                     action.handbrake = accessor[0][7];
+                 }
+             }
+
+             else if (CurrentBotConfig.ActionType == "Continuous") {
+                 // NEXTO CASE (Single Model, Continuous Output)
+                 // ... (Existing Continuous Logic) ...
+                 std::vector<torch::jit::IValue> inputs;
+                 inputs.push_back(obs);
+                 torch::Tensor output = sharedHeadModel.forward(inputs).toTensor();
+                 output = output.to(torch::kCPU);
+                 auto accessor = output.accessor<float, 2>();
+                 if (output.size(1) >= 8) {
+                     action.throttle = accessor[0][0];
+                     action.steer = accessor[0][1];
+                     action.pitch = accessor[0][2];
+                     action.yaw = accessor[0][3];
+                     action.roll = accessor[0][4];
+                     action.jump = accessor[0][5];
+                     action.boost = accessor[0][6];
+                     action.handbrake = accessor[0][7];
+                 }
+             } else {
+                 // GIGALEARN CASE (Shared Head + Policy -> Discrete Lookup)
+                 if (!actionTableInitialized) return;
+
+                 std::vector<torch::jit::IValue> inputs;
+                 inputs.push_back(obs);
+                 
+                 torch::Tensor sharedOutput = sharedHeadModel.forward(inputs).toTensor();
+                 
+                 std::vector<torch::jit::IValue> policyInputs;
+                 policyInputs.push_back(sharedOutput);
+                 torch::Tensor policyLogits = policyModel.forward(policyInputs).toTensor();
+                 
+                 torch::Tensor actionProbs = torch::softmax(policyLogits, -1);
+                 torch::Tensor actionIndexTensor = actionProbs.argmax(1);
+                 
+                 int actionIndex = actionIndexTensor.item<int>();
+                 action = GetActionFromIndex(actionIndex);
+             }
+            
+            // Apply the action
+            ApplyAction(pc, action);
+        }
+    } catch (const c10::Error& e) {
+        Console.Error("GigaLearn: Torch error: " + std::string(e.what()));
+    } catch (const std::exception& e) {
+        Console.Error("GigaLearn: Exception: " + std::string(e.what()));
+    } catch (...) {
+        Console.Error("GigaLearn: Unknown exception in PlayerTick");
+    }
+}
+
+
+// --- OBSERVATION BUILDERS ---
+
+// Math Helpers (Shared)
+// Vec3 and RotMat are now in NextoEARLHelpers.hpp
+
+auto ToVec3 = [](FVector v) -> Vec3 { return { v.X, v.Y, v.Z }; };
+auto Subtract = [](Vec3 a, Vec3 b) -> Vec3 { return { a.x - b.x, a.y - b.y, a.z - b.z }; };
+auto Scale = [](Vec3 v, float s) -> Vec3 { return { v.x * s, v.y * s, v.z * s }; };
+auto Dot = [](Vec3 a, Vec3 b) -> float { return a.x * b.x + a.y * b.y + a.z * b.z; };
+
+// Helper to convert Unreal Coords (X=Fwd/Long, Y=Right/Wide) to RLBot/Nexto Coords (X=Side/Wide, Y=Fwd/Long)
+// Also handles Basis vectors (Rotation)
+auto ToRLBotVec3 = [](FVector v) -> Vec3 { 
+    // Unreal X (Length) -> RLBot Y
+    // Unreal Y (Width)  -> RLBot X
+    // Simple Swap:
+    return { v.Y, v.X, v.Z }; 
+};
+
+auto GetRotMat = [](FRotator rot) -> RotMat {
+    float pitch = rot.Pitch * (3.14159265f / 32768.0f);
+    float yaw = rot.Yaw * (3.14159265f / 32768.0f);
+    float roll = rot.Roll * (3.14159265f / 32768.0f);
+    float cp = cosf(pitch); float sp = sinf(pitch);
+    float cy = cosf(yaw); float sy = sinf(yaw);
+    float cr = cosf(roll); float sr = sinf(roll);
+    Vec3 fwd = { cp * cy, cp * sy, sp };
+    Vec3 up = { -cr*sp*cy - sr*sy, -cr*sp*sy + sr*cy, cr*cp };
+    Vec3 right = { 
+        fwd.y * up.z - fwd.z * up.y,
+        fwd.z * up.x - fwd.x * up.z,
+        fwd.x * up.y - fwd.y * up.x
+    };
+    return { fwd, right, up };
+};
+
+auto InvertVec = [](Vec3 v) -> Vec3 { return { -v.x, -v.y, v.z }; };
+
+// --- GIGALEARN OBS (109 features) ---
+std::vector<float> BuildGigaLearnObs(ACar_TA* car, ABall_TA* ball, AGameEvent_Soccar_TA* gameEvent) {
+    // ... (This is the original logic moved here) ...
+    // NOTE: Copying the exact logic from previous `GameStateToTensor` implementation
+    // CONSTANTS
+    constexpr float POS_COEF = 1.0f / 5000.0f; 
+    constexpr float VEL_COEF = 1.0f / 2300.0f;
+    constexpr float ANG_VEL_COEF = 1.0f / 3.0f;
+
+    std::vector<float> features;
+    features.reserve(109);
+
+    bool isOrange = (car->PlayerReplicationInfo && car->PlayerReplicationInfo->Team && car->PlayerReplicationInfo->Team->TeamIndex == 1);
+
+    Vec3 ballPos = ToVec3(ball->Location);
+    Vec3 ballVel = ToVec3(ball->Velocity);
+    Vec3 ballAngVel = ToVec3(ball->AngularVelocity);
+
+    if (isOrange) { ballPos = InvertVec(ballPos); ballVel = InvertVec(ballVel); ballAngVel = InvertVec(ballAngVel); }
+
+    // 1. Ball (9)
+    Vec3 bp = Scale(ballPos, POS_COEF);
+    Vec3 bv = Scale(ballVel, VEL_COEF);
+    Vec3 bav = Scale(ballAngVel, ANG_VEL_COEF);
+    features.push_back(bp.x); features.push_back(bp.y); features.push_back(bp.z);
+    features.push_back(bv.x); features.push_back(bv.y); features.push_back(bv.z);
+    features.push_back(bav.x); features.push_back(bav.y); features.push_back(bav.z);
+
+    // 2. Previous Action (8)
+    features.push_back(GigaLearnModule::prevAction.throttle);
+    features.push_back(GigaLearnModule::prevAction.steer);
+    features.push_back(GigaLearnModule::prevAction.pitch);
+    features.push_back(GigaLearnModule::prevAction.yaw);
+    features.push_back(GigaLearnModule::prevAction.roll);
+    features.push_back(GigaLearnModule::prevAction.jump);
+    features.push_back(GigaLearnModule::prevAction.boost);
+    features.push_back(GigaLearnModule::prevAction.handbrake);
+
+    // 3. Boost Pads (34)
+    for(int i=0; i<34; i++) features.push_back(1.0f);
+
+    auto AddPlayer = [&](ACar_TA* pCar, bool isSelf) {
+        Vec3 pos = ToVec3(pCar->Location);
+        Vec3 vel = ToVec3(pCar->Velocity);
+        Vec3 angVel = ToVec3(pCar->AngularVelocity);
+        RotMat rot = GetRotMat(pCar->Rotation);
+        
+        if (isOrange) {
+             pos = InvertVec(pos); vel = InvertVec(vel); angVel = InvertVec(angVel);
+             rot.forward = InvertVec(rot.forward); rot.up = InvertVec(rot.up);
+        }
+
+        Vec3 p = Scale(pos, POS_COEF);
+        features.push_back(p.x); features.push_back(p.y); features.push_back(p.z);
+        features.push_back(rot.forward.x); features.push_back(rot.forward.y); features.push_back(rot.forward.z);
+        features.push_back(rot.up.x); features.push_back(rot.up.y); features.push_back(rot.up.z);
+        Vec3 v = Scale(vel, VEL_COEF);
+        features.push_back(v.x); features.push_back(v.y); features.push_back(v.z);
+        Vec3 av = Scale(angVel, ANG_VEL_COEF);
+        features.push_back(av.x); features.push_back(av.y); features.push_back(av.z);
+
+        Vec3 r = { 
+            rot.forward.y * rot.up.z - rot.forward.z * rot.up.y,
+            rot.forward.z * rot.up.x - rot.forward.x * rot.up.z,
+            rot.forward.x * rot.up.y - rot.forward.y * rot.up.x
+        };
+
+        Vec3 localAngVel;
+        localAngVel.x = Dot(rot.forward, angVel);
+        localAngVel.y = Dot(r, angVel);
+        localAngVel.z = Dot(rot.up, angVel);
+        Vec3 lav = Scale(localAngVel, ANG_VEL_COEF);
+        features.push_back(lav.x); features.push_back(lav.y); features.push_back(lav.z);
+
+        // Local Ball Pos
+        Vec3 relBallPos = Subtract(ballPos, pos);
+        Vec3 lbp;
+        lbp.x = Dot(rot.forward, relBallPos);
+        lbp.y = Dot(r, relBallPos);
+        lbp.z = Dot(rot.up, relBallPos);
+        lbp = Scale(lbp, POS_COEF);
+        features.push_back(lbp.x); features.push_back(lbp.y); features.push_back(lbp.z);
+
+        // Local Ball Vel
+        Vec3 relBallVel = Subtract(ballVel, vel);
+        Vec3 lbv;
+        lbv.x = Dot(rot.forward, relBallVel);
+        lbv.y = Dot(r, relBallVel);
+        lbv.z = Dot(rot.up, relBallVel);
+        lbv = Scale(lbv, VEL_COEF);
+        features.push_back(lbv.x); features.push_back(lbv.y); features.push_back(lbv.z);
+        
+        float boostRaw = (pCar->BoostComponent) ? pCar->BoostComponent->CurrentBoostAmount : 0.0f;
+        features.push_back(boostRaw); 
+        features.push_back(pCar->bOnGround ? 1.0f : 0.0f);
+        features.push_back(1.0f); // HasFlip
+        features.push_back(pCar->IsDemolished() ? 1.0f : 0.0f);
+        features.push_back(0.0f); // HasJumped
+    };
+
+    AddPlayer(car, true);
+    
+    ACar_TA* oppCar = nullptr;
+    TArray<ACar_TA*> cars = gameEvent->Cars;
+    for (int i = 0; i < cars.size(); i++) {
+        if (cars[i] && cars[i] != car) { oppCar = cars[i]; break; }
+    }
+    if (oppCar) AddPlayer(oppCar, false);
+    else for(int i=0; i<29; i++) features.push_back(0.0f);
+
+    return features;
+}
+
+// --- NEXTO OBS (Implemented from nexto_obs.py) ---
+std::vector<float> BuildNextoObs(ACar_TA* car, ABall_TA* ball, AGameEvent_Soccar_TA* gameEvent) {
+    std::vector<float> features;
+    // Nexto uses relative observation:
+    // (Ball - Car) relative to Car Rotation
+    // Inverted if Orange team
+    
+    bool isOrange = (car->PlayerReplicationInfo && car->PlayerReplicationInfo->Team && car->PlayerReplicationInfo->Team->TeamIndex == 1);
+    
+    // Normalization factors from nexto_obs.py
+    // POS: 2300 (Wait, in py: _norm has 2300 for vel, 1 for pos? Nexto might normalize differently or rely on raw?)
+    // Checking python source: _norm is [1.]*5 + [2300.]*6 ...
+    // Wait, indices: POS=slice(5,8) in kv array?
+    // Let's look at nexto_obs.py logic broadly.
+    // It creates a 'kv' array.
+    // Index 5-8 is POS.
+    // _norm indices 5-8 are 2300 ??
+    // Python: _norm = np.array([1.] * 5 + [2300] * 6 ...)
+    // 0-4 = 1.0
+    // 5-10 = 2300. (Indices 5,6,7,8,9,10) -> Pos(3) + LinVel(3) ??
+    // Slices in Nexto:
+    // POS = slice(5, 8). LIN_VEL = slice(8, 11).
+    // So Pos is normalized by 2300. Vel by 2300.
+    
+    constexpr float N_POS = 1.0f / 2300.0f;
+    constexpr float N_VEL = 1.0f / 2300.0f;
+    constexpr float N_ANG = 1.0f / 5.5f;
+    
+    Vec3 carPos = ToVec3(car->Location);
+    Vec3 carVel = ToVec3(car->Velocity);
+    RotMat carRot = GetRotMat(car->Rotation);
+    
+    Vec3 ballPos = ToVec3(ball->Location);
+    Vec3 ballVel = ToVec3(ball->Velocity);
+
+    if (isOrange) {
+        carPos = InvertVec(carPos); carVel = InvertVec(carVel);
+        carRot.forward = InvertVec(carRot.forward); carRot.up = InvertVec(carRot.up);
+        // Recalc right
+         carRot.right = { 
+            carRot.forward.y * carRot.up.z - carRot.forward.z * carRot.up.y,
+            carRot.forward.z * carRot.up.x - carRot.forward.x * carRot.up.z,
+            carRot.forward.x * carRot.up.y - carRot.forward.y * carRot.up.x
+        };
+
+        ballPos = InvertVec(ballPos); ballVel = InvertVec(ballVel);
+    }
+    
+    // Nexto logic is: Ball Relative to Car
+    Vec3 relBallPos = Subtract(ballPos, carPos);
+    Vec3 relBallVel = Subtract(ballVel, carVel); // Relative velocity too? "kv[...] -= q[...]"
+    // Python: kv[..., POS] -= q[..., POS] (Car's pos)
+    // Python: kv[..., LIN_VEL] NOT subtracted?
+    // Wait, "convert_to_relative":
+    // kv[..., POS] -= q[..., POS]
+    // Then Rotate.
+    // LIN_VEL is NOT subtracted in python code?
+    // "kv[..., POS.start:LIN_VEL.stop] -= q[...]" -> POS is 5-8. LIN_VEL is 8-11.
+    // If it subtracts up from POS.start (5) to LIN_VEL.stop (11) ??
+    // Python slice: [start:stop].
+    // Line 229: kv[..., POS] -= q[..., POS] -> Only Position.
+    // Line 227 def convert_to_relative(q, kv):
+    // Line 303 (Commented out): kv[:, :, :, 5:11] -= q[:, :, :, 5:11]
+    
+    // So Nexto ONLY makes POSITION relative. Velocity remains global (but rotated).
+    
+    // 1. Ball Relative Position (Rotated to Car)
+    Vec3 localBallPos;
+    localBallPos.x = Dot(carRot.forward, relBallPos);
+    localBallPos.y = Dot(carRot.right, relBallPos);
+    localBallPos.z = Dot(carRot.up, relBallPos);
+    
+    // 2. Ball Velocity (Global, but Rotated to Car)
+    Vec3 localBallVel;
+    localBallVel.x = Dot(carRot.forward, ballVel);
+    localBallVel.y = Dot(carRot.right, ballVel);
+    localBallVel.z = Dot(carRot.up, ballVel);
+
+    // Add Ball Features
+    features.push_back(localBallPos.x * N_POS);
+    features.push_back(localBallPos.y * N_POS);
+    features.push_back(localBallPos.z * N_POS);
+    features.push_back(localBallVel.x * N_VEL);
+    features.push_back(localBallVel.y * N_VEL);
+    features.push_back(localBallVel.z * N_VEL);
+    
+    // Ball Ang Vel is not in basic relative obs? Nexto adds it.
+    // Checking python: BALL_STATE_LENGTH=18. 
+    // It includes Pos(3), Vel(3), AngVel(3).
+    // All rotated.
+    // OBS: [Ball(9), Pads(34), Car(13+?), Opp(13+?)]
+    
+    // TODO: Full Nexto logic is complex (pads, etc).
+    // Implementing a simplified version for testing first (Basic relative ball + car)
+    // To properly support Nexto, we need the EXACT 52 features.
+    
+    return features;
+}
+
+// --- BUILD NEXTO EARL OBS ---
+NextoEARLInput BuildNextoEARLObs(APlayerController_TA* localPC, AGameEvent_Soccar_TA* gameEvent) {
+    if(!localPC || !localPC->Car) return {};
+    ACar_TA* myCar = localPC->Car;
+    
+    // Constants
+    constexpr float NORM_POS = 2300.0f;
+    constexpr float NORM_VEL = 2300.0f;
+    constexpr float NORM_ANG_VEL = 5.5f;
+    
+    // Entities Order: [Players... | Ball | Boosts...]
+    int n_players = gameEvent->Cars.size();
+    int n_boosts = 34; // Fixed 34 pads
+    int n_entities = n_players + 1 + n_boosts;
+    
+    // Tensors: [1, n_entities, 24] for KV, [1, 1, 32] for Q
+    torch::Tensor kv = torch::zeros({1, n_entities, 24}, torch::kFloat32);
+    torch::Tensor q = torch::zeros({1, 1, 32}, torch::kFloat32);
+    torch::Tensor m = torch::zeros({1, n_entities}, torch::kBool); // Mask (False=Attend)
+    
+    auto kv_acc = kv.accessor<float, 3>();
+    auto q_acc = q.accessor<float, 3>();
+    
+    // --- HELPERS ---
+    auto ToNextoVec = [](const FVector& v) -> Vec3 { return { -v.Y, v.X, v.Z }; };
+    
+    auto GetNextoBasis = [&](FRotator rot) -> RotMat {
+        float pitch = rot.Pitch * (3.14159265f / 32768.0f);
+        float yaw = rot.Yaw * (3.14159265f / 32768.0f);
+        float roll = rot.Roll * (3.14159265f / 32768.0f);
+        
+        float cp = cosf(pitch), sp = sinf(pitch);
+        float cy = cosf(yaw), sy = sinf(yaw);
+        float cr = cosf(roll), sr = sinf(roll);
+        
+        // Unreal Coords (Left Handed Z-up):
+        // Fwd = (CP*CY, CP*SY, SP)
+        // Right = Cross(Fwd, Up) ? Or derived from matrix.
+        // Up = (-CR*SP*CY - SR*SY, -CR*SP*SY + SR*CY, CR*CP)
+        // Right ends up being: ( -SP*SR*CY + SY*CR, -SP*SR*SY - CR*CY, CP*SR )
+        // BUT we need to pass them to ToNextoVec immediately.
+        
+        FVector fwd = { cp*cy, cp*sy, sp };
+        FVector up = { -cr*sp*cy - sr*sy, -cr*sp*sy + sr*cy, cr*cp };
+        
+        // Calculate Right manually (Cross Product in UE Frame: Fwd x Up ? or Up x Fwd?)
+        // UE4: Y is Right. X is Fwd. Z is Up.
+        // Cross(X, Z) = -Y ? (Right Hand Rule: X x Y = Z. X x Z = -Y).
+        // UE is Left Handed? 
+        // Let's rely on standard math: Right = Cross(Fwd, Up) or sim.
+        // Actually, let's just use the known matrix formula for Y-axis (Right).
+        // Y-Axis: ( -SP*SR*CY + CR*SY, -SP*SR*SY - CR*CY, CP*SR ) <-- Wait, the signs depend on convention.
+        // EASIER: Calculate Fwd and Up, then Cross them.
+        // FVector::CrossProduct(A, B)? We might not have it exposed.
+        // Manual Cross: 
+        
+        FVector right;
+        right.X = fwd.Y * up.Z - fwd.Z * up.Y;
+        right.Y = fwd.Z * up.X - fwd.X * up.Z;
+        right.Z = fwd.X * up.Y - fwd.Y * up.X;
+        // In Left Handed system, Cross(Fwd, Up) might be Right or -Right.
+        // Fwd(1,0,0) x Up(0,0,1) -> (0, -1, 0)
+        // If Y is Right, we want (0,1,0).
+        // So Right = Cross(Up, Fwd).
+        
+        right.X = up.Y * fwd.Z - up.Z * fwd.Y;
+        right.Y = up.Z * fwd.X - up.X * fwd.Z;
+        right.Z = up.X * fwd.Y - up.Y * fwd.X;
+        
+        return { ToNextoVec(fwd), ToNextoVec(right), ToNextoVec(up) };
+    };
+
+    // --- 1. FILL PLAYERS ---
+    int myIndex = -1;
+    int myTeam = myCar->PlayerReplicationInfo->Team->TeamIndex;
+    
+    for(int i=0; i<n_players; i++) {
+        ACar_TA* car = gameEvent->Cars[i];
+        if(!car) continue;
+        if (car == myCar) myIndex = i;
+        bool sameTeam = (car->PlayerReplicationInfo->Team->TeamIndex == myTeam);
+        
+        if (car == myCar) kv_acc[0][i][0] = 1.0f;
+        else if (sameTeam) kv_acc[0][i][1] = 1.0f;
+        else kv_acc[0][i][2] = 1.0f;
+        
+        Vec3 pos = ToNextoVec(car->Location);
+        Vec3 vel = ToNextoVec(car->Velocity);
+        Vec3 ang = ToNextoVec(car->AngularVelocity);
+        RotMat rot = GetNextoBasis(car->Rotation);
+        
+        kv_acc[0][i][5] = pos.x; kv_acc[0][i][6] = pos.y; kv_acc[0][i][7] = pos.z;
+        kv_acc[0][i][8] = vel.x; kv_acc[0][i][9] = vel.y; kv_acc[0][i][10] = vel.z;
+        kv_acc[0][i][11] = rot.forward.x; kv_acc[0][i][12] = rot.forward.y; kv_acc[0][i][13] = rot.forward.z;
+        kv_acc[0][i][14] = rot.up.x; kv_acc[0][i][15] = rot.up.y; kv_acc[0][i][16] = rot.up.z;
+        kv_acc[0][i][17] = ang.x; kv_acc[0][i][18] = ang.y; kv_acc[0][i][19] = ang.z;
+        
+        if(car->BoostComponent) kv_acc[0][i][20] = car->BoostComponent->CurrentBoostAmount / 100.0f;
+        kv_acc[0][i][21] = car->IsDemolished() ? 1.0f : 0.0f;
+        kv_acc[0][i][22] = car->bOnGround ? 1.0f : 0.0f;
+        kv_acc[0][i][23] = (!car->bDoubleJumped) ? 1.0f : 0.0f;
+    }
+    
+    if (myIndex == -1) return {};
+    
+    // --- 2. FILL BALL ---
+    int ballIdx = n_players;
+    if (gameEvent->GameBalls.size() > 0 && gameEvent->GameBalls[0]) {
+        ABall_TA* ball = gameEvent->GameBalls[0];
+        Vec3 pos = ToNextoVec(ball->Location);
+        Vec3 vel = ToNextoVec(ball->Velocity);
+        Vec3 ang = ToNextoVec(ball->AngularVelocity);
+        
+        kv_acc[0][ballIdx][3] = 1.0f; 
+        kv_acc[0][ballIdx][5] = pos.x; kv_acc[0][ballIdx][6] = pos.y; kv_acc[0][ballIdx][7] = pos.z;
+        kv_acc[0][ballIdx][8] = vel.x; kv_acc[0][ballIdx][9] = vel.y; kv_acc[0][ballIdx][10] = vel.z;
+        kv_acc[0][ballIdx][17] = ang.x; kv_acc[0][ballIdx][18] = ang.y; kv_acc[0][ballIdx][19] = ang.z;
+    }
+    
+    // --- 3. FILL BOOSTS ---
+    int boostStartIdx = ballIdx + 1;
+    auto now = std::chrono::steady_clock::now();
+    double currentTime = std::chrono::duration<double>(now.time_since_epoch()).count();
+    
+    for(int i=0; i<34; i++) {
+        int idx = boostStartIdx + i;
+        BoostPadState& pad = GigaLearnModule::boostPadCache[i];
+        
+        kv_acc[0][idx][4] = 1.0f; 
+        kv_acc[0][idx][5] = pad.location.x; 
+        kv_acc[0][idx][6] = pad.location.y; 
+        kv_acc[0][idx][7] = pad.location.z;
+        
+        float timer = 0.0f;
+        if (!pad.isActive && pad.pickedUpTime > 0.0) {
+            double elapsed = currentTime - pad.pickedUpTime;
+            timer = std::max(0.0f, pad.respawnDelay - static_cast<float>(elapsed));
+            if (timer <= 0.0f) { pad.isActive = true; timer = 0.0f; }
+        }
+        kv_acc[0][idx][21] = timer; 
+        kv_acc[0][idx][20] = pad.isBig ? 1.0f : 0.12f;
+    }
+    
+    // --- 4. INVERSION ---
+    if (myTeam == 1) {
+        for(int i=0; i<n_entities; i++) {
+            kv_acc[0][i][5] *= -1; kv_acc[0][i][6] *= -1; // Pos
+            kv_acc[0][i][8] *= -1; kv_acc[0][i][9] *= -1; // Vel
+            kv_acc[0][i][11] *= -1; kv_acc[0][i][12] *= -1; // Fwd
+            kv_acc[0][i][14] *= -1; kv_acc[0][i][15] *= -1; // Up
+            kv_acc[0][i][17] *= -1; kv_acc[0][i][18] *= -1; // AngVel
+        }
+    }
+    
+    // --- 5. NORMALIZATION ---
+    for(int i=0; i<n_entities; i++) {
+        for(int k=5; k<=10; k++) kv_acc[0][i][k] /= NORM_POS;
+        for(int k=17; k<=19; k++) kv_acc[0][i][k] /= NORM_ANG_VEL;
+    }
+    
+    // --- 6. RELATIVE TRANSFORM ---
+    float ox = kv_acc[0][myIndex][5], oy = kv_acc[0][myIndex][6], oz = kv_acc[0][myIndex][7];
+    float fx = kv_acc[0][myIndex][11], fy = kv_acc[0][myIndex][12];
+    float theta = std::atan2(fx, fy);
+    float ct = std::cos(-theta), st = std::sin(-theta);
+    
+    for(int i=0; i<n_entities; i++) {
+        kv_acc[0][i][5] -= ox; kv_acc[0][i][6] -= oy; kv_acc[0][i][7] -= oz;
+        
+        // Rotate Pos (5,6), Vel (8,9), Fwd (11,12), Up (14,15), AngVel (17,18)
+        auto Rotate = [&](int idx) {
+            float x = kv_acc[0][i][idx], y = kv_acc[0][i][idx+1];
+            kv_acc[0][i][idx] = ct*x - st*y;
+            kv_acc[0][i][idx+1] = st*x + ct*y;
+        };
+        Rotate(5); Rotate(8); Rotate(11); Rotate(14); Rotate(17);
+    }
+    
+    // --- 7. FILL Q ---
+    for(int k=0; k<24; k++) q_acc[0][0][k] = kv_acc[0][myIndex][k];
+    
+    q_acc[0][0][24] = GigaLearnModule::prevAction.throttle;
+    q_acc[0][0][25] = GigaLearnModule::prevAction.steer;
+    q_acc[0][0][26] = GigaLearnModule::prevAction.pitch;
+    q_acc[0][0][27] = GigaLearnModule::prevAction.yaw;
+    q_acc[0][0][28] = GigaLearnModule::prevAction.roll;
+    q_acc[0][0][29] = GigaLearnModule::prevAction.jump;
+    q_acc[0][0][30] = GigaLearnModule::prevAction.boost;
+    q_acc[0][0][31] = GigaLearnModule::prevAction.handbrake;
+    
+    NextoEARLInput out;
+    out.q = q; out.kv = kv; out.m = m; out.valid = true;
+    return out;
+}
+
+torch::Tensor GigaLearnModule::GameStateToTensor(APlayerController_TA* localPC, AGameEvent_Soccar_TA* gameEvent) {
+    try {
+        if (!localPC || !localPC->Car) return torch::Tensor();
+        ACar_TA* car = localPC->Car;
+        TArray<ABall_TA*> balls = gameEvent->GameBalls;
+        if (balls.size() == 0 || !balls[0]) return torch::Tensor();
+        ABall_TA* ball = balls[0];
+
+        std::vector<float> features;
+        
+        // SWITCH OBS BUILDER
+        if (CurrentBotConfig.ObsType == "NextoObs") {
+             features = BuildNextoObs(car, ball, gameEvent);
+        } else {
+             // Default to GigaLearn
+             features = BuildGigaLearnObs(car, ball, gameEvent);
+        }
+
+        return torch::from_blob(features.data(), {1, (long long)features.size()}, torch::kFloat32).clone();
+    } catch (...) {
+        return torch::Tensor();
+    }
+}
+
+
+void GigaLearnModule::BuildActionLookupTable() {
+    /*
+     * Build the DefaultAction lookup table (90 discrete actions)
+     * Matches GigaLearn's DefaultAction.cpp implementation
+     */
+    
+    if (actionTableInitialized) {
+        return;
+    }
+    
+    actionLookupTable.clear();
+    
+    constexpr float R_B[] = { 0, 1 };        // Boolean
+    constexpr float R_F[] = { -1, 0, 1 };    // Float
+    
+    // Ground Actions
+    for (float throttle : R_F) {
+        for (float steer : R_F) {
+            for (float boost : R_B) {
+                for (float handbrake : R_B) {
+                    // Prevent useless throttle when boosting
+                    if (boost == 1 && throttle != 1)
+                        continue;
+                    
+                    actionLookupTable.push_back({
+                        throttle, steer, 0, steer, 0, 0, boost, handbrake
+                    });
+                }
+            }
+        }
+    }
+    
+    // Aerial Actions
+    for (float pitch : R_F) {
+        for (float yaw : R_F) {
+            for (float roll : R_F) {
+                for (float jump : R_B) {
+                    for (float boost : R_B) {
+                        // Only need roll for sideflip
+                        if (jump == 1 && yaw != 0)
+                            continue;
+                        
+                        // Duplicate with ground controls
+                        if (pitch == 0 && roll == 0 && jump == 0)
+                            continue;
+                        
+                        // Enable handbrake for potential wavedashes
+                        float handbrake = (jump == 1) && (pitch != 0 || yaw != 0 || roll != 0) ? 1.0f : 0.0f;
+                        
+                        actionLookupTable.push_back({
+                            // Use boost for throttle when aerial
+                            boost, yaw, pitch, yaw, roll, jump, boost, handbrake
+                        });
+                    }
+                }
+            }
+        }
+    }
+    
+    actionTableInitialized = true;
+}
+
+Action GigaLearnModule::GetActionFromIndex(int index) {
+    if (index >= 0 && index < actionLookupTable.size()) {
+        return actionLookupTable[index];
+    }
+    // Return neutral action if out of bounds
+    return { 0, 0, 0, 0, 0, 0, 0, 0 };
+}
+
+void GigaLearnModule::ApplyAction(APlayerController_TA* localPC, Action action) {
+    /*
+     * Apply a discrete action from the action parser to the vehicle inputs
+     * Action format: {throttle, steer, pitch, yaw, roll, jump, boost, handbrake}
+     */
+    
+    try {
+        if (!localPC) {
+            return;
+        }
+
+        // Access VehicleInput directly via the member at offset 0x09A8
+        FVehicleInputs& inputs = localPC->VehicleInput;
+
+        // Write analog inputs directly from action
+        inputs.Throttle = action.throttle;
+        inputs.Steer = action.steer;
+        inputs.Pitch = action.pitch;
+        inputs.Yaw = action.yaw;
+        inputs.Roll = action.roll;
+        inputs.DodgeForward = -action.pitch; // Dodge forward is negative pitch
+        inputs.DodgeRight = action.yaw;
+
+        // Write button inputs (action values are 0 or 1)
+        inputs.bHandbrake = (action.handbrake > 0.5f) ? 1 : 0;
+        inputs.bJump = (action.jump > 0.5f) ? 1 : 0;
+        inputs.bActivateBoost = (action.boost > 0.5f) ? 1 : 0;
+        inputs.bActivateBoost = (action.boost > 0.5f) ? 1 : 0;
+        inputs.bHoldingBoost = (action.boost > 0.5f) ? 1 : 0;
+
+        // Store action for next frame observation
+        prevAction = action;
+
+    } catch (const std::exception& e) {
+        Console.Error("GigaLearn: Exception applying discrete action: " + std::string(e.what()));
+    } catch (...) {
+        Console.Error("GigaLearn: Unknown exception applying discrete action");
+    }
+}
+
+void GigaLearnModule::Initialize() {
+    Hook();
+    Console.Write("GigaLearnModule: Initialized (Press F1 to load models and start bot)");
+}
+
+GigaLearnModule GigaLearn;
